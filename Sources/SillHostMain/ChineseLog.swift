@@ -115,8 +115,16 @@ enum ChineseLog {
         ("paused", "已暂停"),
     ]
 
-    /// 在 main.swift 最早期调用一次。SILL_LANG=en 时完全不介入。
-    static func install() {        guard ProcessInfo.processInfo.environment["SILL_LANG"] != "en" else { return }
+    /// 每个进程只装一次：重复 dup2 会把翻译管道再套一层。
+    nonisolated(unsafe) private static var installed = false
+
+    /// 在任何 print 之前调用一次。SILL_LANG=en 时不翻译；没有 `sink` 时也就完全不介入。
+    /// `sink`：融合 app 在自己进程里跑被控端时，用它拿到每一行（已翻译）显示在控制台并落盘，
+    /// 在读线程上调用。
+    static func install(sink: (@Sendable (String) -> Void)? = nil) {
+        let translates = ProcessInfo.processInfo.environment["SILL_LANG"] != "en"
+        guard translates || sink != nil, !installed else { return }
+        installed = true
         let original = dup(STDOUT_FILENO)
         guard original >= 0 else { return }
         var fds: [Int32] = [0, 0]
@@ -138,17 +146,21 @@ enum ChineseLog {
                     let lineData = pending.prefix(upTo: nl)
                     pending = Data(pending.suffix(from: pending.index(after: nl)))
                     let line = String(data: lineData, encoding: .utf8) ?? ""
-                    let text = Array((translate(line) + "\n").utf8)
+                    let out = translates ? translate(line) : line
+                    let text = Array((out + "\n").utf8)
                     _ = text.withUnsafeBufferPointer { buf in
                         Darwin.write(original, buf.baseAddress, buf.count)
                     }
+                    sink?(out)
                 }
             }
             if !pending.isEmpty, let tail = String(data: pending, encoding: .utf8) {
-                let text = Array(translate(tail).utf8)
+                let out = translates ? translate(tail) : tail
+                let text = Array(out.utf8)
                 _ = text.withUnsafeBufferPointer { buf in
                     Darwin.write(original, buf.baseAddress, buf.count)
                 }
+                sink?(out)
             }
         }
     }
