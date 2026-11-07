@@ -163,6 +163,8 @@ final class WindowCatalog {
     /// macOS reminds the person about it once a month and after every rebuilt binary). The Desktop
     /// is the test pattern anyway. Read off the main actor by the bounded lookup below.
     nonisolated(unsafe) static var screenless = false
+    /// 屏幕录制权限缺失时只打印一次指引，避免每 2 秒刷屏。
+    nonisolated(unsafe) static var reportedNoScreenPermission = false
 
     /// Starts the one-time installed-app scan, and polling if a client is already connected.
     /// Does not read the window list itself: the coordinator awaits `refreshWindows()` right after.
@@ -200,6 +202,13 @@ final class WindowCatalog {
 
     /// One of this process's own windows (Settings, the log, the pairing window with its code).
     static func isOwn(_ w: SCWindow) -> Bool { w.owningApplication?.processID == ownPID }
+
+    /// 与本进程同属一个 app bundle 的窗口。融合版（SillRemote --host-mode）的控制台界面跑在同 bundle 的
+    /// 另一个进程里，光比 pid 挡不住，会被当成可串流窗口列进列表。
+    static func isSameApp(_ app: SCRunningApplication) -> Bool {
+        guard let own = Bundle.main.bundleIdentifier, !own.isEmpty else { return false }
+        return app.bundleIdentifier == own
+    }
 
     /// The displays macOS has active now (connected, awake, drawable; Sill's own virtual display too
     /// while it exists), by ID: what the last look's display is judged against before a capture is
@@ -284,7 +293,22 @@ final class WindowCatalog {
         refreshSeq += 1
         let seq = refreshSeq
         guard !Self.screenless else { return }      // TEST ONLY: ScreenCaptureKit never asked
-        guard let content = try? await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true) else { return }
+        // 只列屏幕上可见的窗口（上游原样）。最小化的、在别的桌面空间的、隐藏 app 的窗口，
+        // ScreenCaptureKit 只给一帧 suspended 就再无画面：列出来只会让设备选了一片黑。
+        // 要串流这样的 app，设备从「所有应用」里启动它（kind 7，reopen 会把窗口带回屏幕）。
+        guard let content = try? await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true) else {
+            // 最常见的失败原因就是「屏幕录制」没授权：系统不再允许程序弹这个框，
+            // 只能人工在设置里用「+」把 app 加进列表。这里明确说清楚，否则远端只看到
+            // 「窗口列表 0 个」，无从判断是权限还是没窗口。
+            if !Self.reportedNoScreenPermission {
+                Self.reportedNoScreenPermission = true
+                print("⚠️ 拿不到窗口列表：屏幕录制权限未授予。")
+                print("   系统设置 › 隐私与安全性 › 屏幕录制 › 点「+」添加 \(Bundle.main.bundlePath)")
+                print("   （macOS 不再允许程序自行弹这个授权框，只能手动加一次；加好后无需重启被控端。）")
+            }
+            return
+        }
+        Self.reportedNoScreenPermission = false
         // The staged window, if the on-screen list dropped it: one extra SCShareableContent call per
         // poll, and only then. Fetched before the sequence check so its await cannot let an older
         // refresh overwrite a newer one.
@@ -306,6 +330,7 @@ final class WindowCatalog {
             return w.windowLayer == 0                                  // drops widgets, wallpaper, backstop
                 && w.frame.width > 100 && w.frame.height > 100
                 && app.processID != Self.ownPID
+                && !Self.isSameApp(app)                                // 融合 app 自己的控制台窗口
                 && !Self.isSystemHelperWindow(w)
         }
         if let pinned, !visible.contains(where: { $0.windowID == pinned.windowID }) { visible.append(pinned) }

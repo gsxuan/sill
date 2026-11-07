@@ -40,20 +40,26 @@ final class SyntheticCapture: @unchecked Sendable {   // state is confined to `q
     private var frameIndex = 0
     private var fps = 60
     private var startedAt: TimeInterval = 0
+    /// 原始帧模式（SILL_RAW_FRAMES=1）：直接产出 BGRA，让被测链路走的就是真实路径
+    /// （ScreenCaptureKit 在原始帧模式下的格式），不额外插一次色彩转换。
+    private var bgra = false
     /// The picture's planes at the frame's size (`SILL_TEST_PATTERN=picture:`), nil for the pattern.
     private var picture: SyntheticPicture?
 
-    func start(width: Int, height: Int, fps: Int) {
+    func start(width: Int, height: Int, fps: Int, bgra wantsBGRA: Bool = false) {
         timer?.cancel()
-        let attrs: [CFString: Any] = [kCVPixelBufferPixelFormatTypeKey: kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
+        // 有图片素材时仍旧走 420v（picture 的填充是按平面写的），其余场景按调用方要的格式建池。
+        let picture = Self.picturePath.flatMap { SyntheticPicture(path: $0, width: width, height: height) }
+        let useBGRA = wantsBGRA && picture == nil
+        let attrs: [CFString: Any] = [kCVPixelBufferPixelFormatTypeKey: useBGRA ? kCVPixelFormatType_32BGRA
+                                                                              : kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
                                       kCVPixelBufferWidthKey: width, kCVPixelBufferHeightKey: height,
                                       kCVPixelBufferIOSurfacePropertiesKey: [:] as CFDictionary]
         var pool: CVPixelBufferPool?
         CVPixelBufferPoolCreate(nil, nil, attrs as CFDictionary, &pool)
-        let picture = Self.picturePath.flatMap { SyntheticPicture(path: $0, width: width, height: height) }
         if let path = Self.picturePath, picture == nil { print("Synthetic capture: \(path) did not load; the pattern instead (SILL_TEST_PATTERN)") }
         queue.async { [weak self] in
-            self?.pool = pool; self?.frameIndex = 0; self?.fps = fps; self?.picture = picture
+            self?.pool = pool; self?.frameIndex = 0; self?.fps = fps; self?.picture = picture; self?.bgra = useBGRA
             self?.startedAt = ProcessInfo.processInfo.systemUptime
         }   // ordered before the timer's first tick
         let timer = DispatchSource.makeTimerSource(queue: queue)
@@ -84,6 +90,27 @@ final class SyntheticCapture: @unchecked Sendable {   // state is confined to `q
         CVPixelBufferLockBaseAddress(pb, [])
         let w = CVPixelBufferGetWidthOfPlane(pb, 0), h = CVPixelBufferGetHeightOfPlane(pb, 0)
         if let picture, picture.fill(pb) {
+            CVPixelBufferUnlockBaseAddress(pb, [])
+            Stats.shared.bump("cap.complete")
+            onFrame?(pb, CMClockGetTime(CMClockGetHostTimeClock()))
+            return
+        }
+        if bgra, let base = CVPixelBufferGetBaseAddress(pb) {
+            // BGRA 版同一套图案：灰底 + 一条横向扫过的亮条。屏幕内容以外的部分不重要，
+            // 这里要的是「每帧像素都不同」和「字节量确定」，好量原始帧链路的真实上限。
+            let bw = CVPixelBufferGetWidth(pb), bh = CVPixelBufferGetHeight(pb)
+            let stride = CVPixelBufferGetBytesPerRow(pb)
+            memset(base, 96, stride * bh)
+            let barPixels = max(8, bw / 20)
+            let x0 = (frameIndex * max(1, bw / fps)) % max(1, bw - barPixels)
+            for row in 0..<bh { memset(base.advanced(by: row * stride + x0 * 4), 235, barPixels * 4) }
+            if Self.noise {
+                let side = min(bw, bh) / 3
+                let left = (bw - side) / 2
+                for row in (bh - side) / 2 ..< (bh + side) / 2 {
+                    arc4random_buf(base.advanced(by: row * stride + left * 4), side * 4)
+                }
+            }
             CVPixelBufferUnlockBaseAddress(pb, [])
             Stats.shared.bump("cap.complete")
             onFrame?(pb, CMClockGetTime(CMClockGetHostTimeClock()))

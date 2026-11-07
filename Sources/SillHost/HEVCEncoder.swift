@@ -162,10 +162,12 @@ final class HEVCEncoder {
         set(kVTCompressionPropertyKey_RealTime, kCFBooleanTrue)
         set(kVTCompressionPropertyKey_ProfileLevel, kVTProfileLevel_HEVC_Main_AutoLevel)
         set(kVTCompressionPropertyKey_AllowFrameReordering, kCFBooleanFalse)      // no B-frames
-        // Keyframes are requested on demand (new client, dropped delta, source switch); this is
-        // only a safety interval. Longer intervals cut the periodic IDR hitch; 4 s is the value
-        // every working stream so far has used.
-        set(kVTCompressionPropertyKey_MaxKeyFrameInterval, (fps * 4) as CFNumber)
+        // 极致模式：最大关键帧间隔 2 秒。丢失帧后恢复更快，降低最坏情况延迟。
+        // 按需仍会自动插入关键帧；这只是兜底间隔。
+        set(kVTCompressionPropertyKey_MaxKeyFrameInterval, (fps * 2) as CFNumber)
+        if #available(macOS 12.0, *) {
+            set(kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration, 2 as CFNumber)
+        }
         set(kVTCompressionPropertyKey_ExpectedFrameRate, fps as CFNumber)
         set(kVTCompressionPropertyKey_AverageBitRate, bitrate as CFNumber)
         set(kVTCompressionPropertyKey_DataRateLimits, [bitrate / 8, 1] as CFArray)

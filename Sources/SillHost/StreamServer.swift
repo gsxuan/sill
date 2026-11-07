@@ -438,6 +438,8 @@ final class StreamServer {
     private var started = false
     private let portLock = NSLock()                  // `port` is read on the main actor
     private var readyPort: UInt16?
+    /// 可选 UDP 视频通道（SILL_UDP_PORT 启用）。TCP 控制面始终保留。
+    private var udpFanout: UDPFanout?
     /// 6× the shortest clean pause measured, and past the ~1 s the old record's removal takes to show.
     private static let advertiseDelay: TimeInterval = 1.5
     /// `.cancelled` came within 2 ms in every measurement; without it the replacement takes any port.
@@ -472,8 +474,20 @@ final class StreamServer {
         homeDoor = door
         // TEST ONLY: SILL_TEST_LOOPBACK, on a test host alone (anywhere else TestHooks says it is ignored).
         if test, Self.testLoopback { print("Test listener: loopback only (SILL_TEST_LOOPBACK); reach this host at 127.0.0.1.") }
-        listener = try Self.makeListener(peerToPeer: false, port: nil, tls: door?.tlsOptions(), loopback: test && Self.testLoopback)
+        // 固定家庭入口端口：雷雳直连 / 隔离局域网里 mDNS 不通时，客户端可直接按 IP+端口连。
+        // 设置 SILL_HOME_PORT=7456 即可；不设置则沿用上游的随机端口。
+        let fixedPort: NWEndpoint.Port? = ProcessInfo.processInfo.environment["SILL_HOME_PORT"]
+            .flatMap { UInt16($0) }
+            .flatMap { NWEndpoint.Port(rawValue: $0) }
+        listener = try Self.makeListener(peerToPeer: false, port: fixedPort, tls: door?.tlsOptions(), loopback: test && Self.testLoopback)
         listener.service = makeService()
+        // 融合版新增：SILL_UDP_PORT=7457 时额外开一条 UDP 视频通道。
+        if let text = ProcessInfo.processInfo.environment["SILL_UDP_PORT"],
+           let port = UInt16(text), let fanout = UDPFanout(port: port) {
+            fanout.start()
+            udpFanout = fanout
+            print("UDP 视频通道已启用，端口 \(port)（控制面仍走 TCP）")
+        }
         wire(listener)
         door?.server = self
     }
@@ -1567,6 +1581,8 @@ final class StreamServer {
     /// nothing of it goes out but the placeholder (a frame withheld here is never counted against a link).
     func broadcast(_ message: StreamMessage, picture: LockPolicy.Picture? = nil) {
         let data = message.serialized()
+        // 融合版新增：帧与参数集同时走 UDP（客户端在 UDP 模式下忽略 TCP 帧）。
+        udpFanout?.send(message)
         queue.async { [self] in
             if lockGate.withholds(message.kind, picture: picture) { withheld(message.kind, for: nil); return }
             if message.kind == .parameterSets { lastParameterSets = data }
@@ -1619,6 +1635,31 @@ final class StreamServer {
     // Each message sets `lastSentAt`, so a TLS client (every remote one, and a TLS home one) skips its
     // tick while sound flows (the sound keeps the radio awake instead). Only a cap on what a device
     // has not taken (`audioCap`) skips a packet: a stalled link's safety valve, not pacing.
+
+    /// 未压缩帧（kind 45）的广播：没有编码器，也就没有关键帧——一帧就是一整幅画面。
+    /// 这里的背压是「丢新帧」而不是排队：某个客户端手上还压着超过一帧半的字节，
+    /// 这一帧就不给它了，等它把队列读空时自然会收到更新的那一帧。
+    /// 排队的原始帧等于排队的延迟，而 22 MB 一帧排队三帧就是 200 ms 的画面滞后。
+    /// `data` 必须是**已序列化**的整条消息（14 字节 StreamMessage 头 + 载荷）：
+    /// 一帧 20+ MB，这里不再套一层去复制一次。
+    /// Thread-safe（内部切到网络队列）。
+    func broadcastRaw(_ data: Data, picture: LockPolicy.Picture) {
+        // 一帧 22.9 MB，容差给半帧：链路抖一下不至于把画面切成幻灯片。
+        let backlogLimit = data.count + data.count / 2
+        queue.async { [self] in
+            if lockGate.withholds(.frame, picture: picture) {
+                withheld(.frame, for: nil)
+                return
+            }
+            for client in clients.values where client.connection.state == .ready {
+                if client.pendingBytes > backlogLimit {
+                    Stats.shared.bump("raw.drop")
+                    continue
+                }
+                send(data, to: client, isFrame: true)
+            }
+        }
+    }
 
     /// Sound messages a device may leave untaken before a packet is skipped (`aud.drop`). At home a
     /// second: the picture never queues there (the delta-drop rule), so a longer queue of sound is a

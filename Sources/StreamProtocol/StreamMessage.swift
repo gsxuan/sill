@@ -84,6 +84,9 @@ public enum StreamMessageKind: UInt8 {
     // The picture's recovery (issue #101), after the numbers open pull requests hold (29 to 31 and 33
     // to 43). Older hosts map it to `.unknown` and skip it: the device's picture then waits for the
     // stream's next keyframe, as it always did.
+    /// 未压缩原始帧（SillRemote 融合版的「极致」模式，kind 45）：不走 HEVC，host 直接把捕获到的
+    /// BGRA 像素发过来。payload = RawFrameHeader（32 字节）+ width×height×4 的像素。
+    /// 只在雷雳/USB 直连或万兆局域网这类带宽充裕的链路上用；老客户端把它当 `.unknown` 跳过。
     case keyframeRequest = 44 // device → host, empty payload: this device's picture was interrupted (its display
                              // layer failed, or iOS stopped it while Sill was away) and waits for a keyframe,
                              // which a still window never sends by itself. The host asks its encoder for one
@@ -91,6 +94,7 @@ public enum StreamMessageKind: UInt8 {
                              // From the device once per interruption while its keyframe is due, again when it
                              // has not come in 4 s (or four round trips), 2 s apart at least (KeyframeRecovery);
                              // at most one a second per connection on the host
+    case rawFrame = 45       // host → device: RawFrameHeader + packed BGRA pixels, no encoder. See RawFrameHeader.
     case unknown = 255       // never sent: what parseHeader yields for a kind this build does not know
 }
 
@@ -113,6 +117,9 @@ public struct StreamMessage {
     public static let maxPairingPayload = 4096
     /// A video frame, as a device accepts it (a Retina keyframe is 1–2 MB).
     public static let maxFramePayload = 32 << 20
+    /// One uncompressed frame (kind 45): 5K BGRA is 5120×2880×4 = 56 MB, plus its 32-byte header.
+    /// Only a raw-mode host ever announces one, and only over a link that can carry it.
+    public static let maxRawFramePayload = 64 << 20
     /// Any other host → device message (window lists, icons, thumbnails, the app list).
     public static let maxOtherHostPayload = 4 << 20
 
@@ -147,6 +154,62 @@ public struct StreamMessage {
         let key = data[data.startIndex + 9] == 1
         let len = Int(data.readBigEndian(UInt32.self, at: 10))
         return StreamHeader(kind: kind, timestamp: ts, isKeyframe: key, payloadLength: len)
+    }
+}
+
+/// 未压缩帧（kind 45）的载荷头，紧跟在 14 字节 StreamMessage 头之后：32 字节定长，大端，
+/// 后面就是 `height × stride` 字节的像素。`stride` 是收紧后的行宽（= width × 4），
+/// 不是 CVPixelBuffer 那种带对齐填充的 bytesPerRow——发送端已经把填充去掉。
+public struct RawFrameHeader {
+    /// "SRAW"
+    public static let magic: UInt32 = 0x5352_4157
+    public static let length = 32
+    /// BGRA8，内存字节序就是 B,G,R,A（与 kCVPixelFormatType_32BGRA 一致）。
+    public static let formatBGRA8: UInt32 = 32
+    /// 紧密排列的 B,G,R（每像素 3 字节）。屏幕截图里 alpha 恒为 255，发它纯粹浪费 25% 带宽：
+    /// 43.7 MB 一帧降到 32.8 MB，120 fps 才装得进雷雳 4 的 40 Gb/s。
+    public static let formatBGR8: UInt32 = 24
+
+    public var width: Int
+    public var height: Int
+    public var stride: Int
+    public var format: UInt32
+    /// 单调递增，接收端据此发现自己漏了帧（TCP 上只是统计，UDP 未来可用）。
+    public var frameID: UInt64
+
+    public init(width: Int, height: Int, stride: Int, format: UInt32 = RawFrameHeader.formatBGRA8, frameID: UInt64) {
+        self.width = width
+        self.height = height
+        self.stride = stride
+        self.format = format
+        self.frameID = frameID
+    }
+
+    public var byteCount: Int { stride * height }
+
+    public func encoded(into d: inout Data) {
+        d.appendBigEndian(Self.magic)
+        d.appendBigEndian(UInt32(width))
+        d.appendBigEndian(UInt32(height))
+        d.appendBigEndian(UInt32(stride))
+        d.appendBigEndian(format)
+        d.appendBigEndian(UInt32(0))          // reserved
+        d.appendBigEndian(frameID)
+    }
+
+    public init?(decoding d: Data) {
+        guard d.count >= Self.length else { return nil }
+        guard d.readBigEndian(UInt32.self, at: 0) == Self.magic else { return nil }
+        let w = Int(d.readBigEndian(UInt32.self, at: 4))
+        let h = Int(d.readBigEndian(UInt32.self, at: 8))
+        let s = Int(d.readBigEndian(UInt32.self, at: 12))
+        let f = d.readBigEndian(UInt32.self, at: 16)
+        let id = d.readBigEndian(UInt64.self, at: 24)
+        // 尺寸来自对端，收下之前先做合理性检查：宽高为正，行宽至少装得下一行像素。
+        // 最窄的格式是 BGR8（每像素 3 字节），所以下限按 3 算。
+        guard w > 0, h > 0, s >= w * 3, w <= 16384, h <= 16384,
+              f == Self.formatBGRA8 || f == Self.formatBGR8 else { return nil }
+        width = w; height = h; stride = s; format = f; frameID = id
     }
 }
 

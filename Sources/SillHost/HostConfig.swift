@@ -101,7 +101,8 @@ package struct HostConfig: Equatable, Sendable {
     /// (`app`).
     package static let standard = HostConfig(maxFPS: 120, captureScale: 2, bitrate: 15_000_000,
                                              awayBitrate: 4_000_000, awayCaptureScale: 1,
-                                             prioritizeSpeed: false, virtualDisplay: false, directWireless: false,
+                                             // 极致模式默认开启：Apple 编码器用速度换质量，降低编码耗时。
+                                             prioritizeSpeed: true, virtualDisplay: false, directWireless: false,
                                              remoteAccess: false, remotePort: 7455, internetAccess: false,
                                              requirePairing: true, shareClipboard: true, sendAudio: false)
 

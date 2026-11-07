@@ -55,6 +55,13 @@ package final class StreamCoordinator {
     let capture = WindowCapture()
     /// `--synthetic`: the Desktop source streams a test pattern instead of the screen.
     let synthetic: Bool
+    /// 未压缩原始帧模式（`SILL_RAW_FRAMES=1`，控制台的「极致原始帧」开关）：不建 HEVC 编码器，
+    /// 捕获到的像素按 kind 45 原样发给客户端。3016×1898 一帧约 23 MB，60 fps 要 11 Gb/s——
+    /// 只有雷雳/USB 直连或万兆局域网扛得住，所以默认关。开了之后画质是「像素级完全相同」，
+    /// 延迟也少掉整条编码/解码链，代价是带宽。
+    package let rawFrames: Bool = ProcessInfo.processInfo.environment["SILL_RAW_FRAMES"] == "1"
+    /// 当前流水线的原始帧发送器（原始帧模式才有，其余为 nil）。
+    private var rawSender: RawFrameSender?
     let syntheticCapture = SyntheticCapture()
     /// A locked Mac's placeholder (LockPolicy): a black still, no ScreenCaptureKit.
     let stillCapture = StillCapture()
@@ -822,7 +829,10 @@ package final class StreamCoordinator {
         if config.sendAudio { audio.prepare() }       // the codec, loaded before the first chunk needs it
         server.start()
         remote?.apply(config)        // the remote door, when Remote Access is on (or a pairing window opens later)
-        if promptForPermissions || CGPreflightScreenCaptureAccess() { await catalog.refreshWindows() }
+        // 总是先看一眼窗口列表：没有权限时 Catalog 会打印一次明确的授权指引
+        // （以前这里是 `CGPreflightScreenCaptureAccess()` 守卫，没权限就静默跳过，
+        //  远端只看到 0 个窗口，根本不知道是没授权）。
+        await catalog.refreshWindows()
         if let match = preselect?.lowercased(),
            let w = catalog.infos.first(where: { $0.appName.lowercased().contains(match) || $0.title.lowercased().contains(match) }) {
             await select(.window(w.id), bringForward: true)   // a pick, made on the command line
@@ -1842,6 +1852,7 @@ package final class StreamCoordinator {
         releaseKeysOfDevicesThatLeft()
         injector.stopRepeating()            // nor does a held key repeat into the next source (KeyRepeat)
         encoder = nil                  // deinit invalidates the VT session
+        rawSender = nil                // 原始帧模式：同样在两条流水线之间才换
         server.resetForNewStream()          // every client waits for the next parameter sets + keyframe
         lastParameterSets = nil             // and the new stream's first go out as a new frame (DisplayWake)
         // New settings take effect here, between pipelines, before the rate, the scale and the
@@ -2171,16 +2182,17 @@ package final class StreamCoordinator {
     private func startPipeline(source: StreamSource, filter: SCContentFilter?, sourceRect: CGRect?, displayScale: CGFloat?,
                                width: Int, height: Int, describe: String,
                                title: String, kind: HostStatusSnapshot.Stream.Kind, picture: LockPolicy.Picture) async throws {
-        let enc = try HEVCEncoder(width: width, height: height, fps: fps, bitrate: streamBitrate, prioritizeSpeed: prioritizeSpeed,
-                                  software: useSoftwareEncoder)
-        enc.onHung = { [weak self, weak enc] in
+        let raw = rawFrames
+        let enc = try raw ? nil : HEVCEncoder(width: width, height: height, fps: fps, bitrate: streamBitrate,
+                                              prioritizeSpeed: prioritizeSpeed, software: useSoftwareEncoder)
+        enc?.onHung = { [weak self, weak enc] in
             Task { @MainActor in
                 guard let enc else { return }
                 await self?.encoderHung(enc)
             }
         }
         let server = self.server
-        enc.onEncoded = { [weak self] data, isKey, parameterSets in
+        enc?.onEncoded = { [weak self] data, isKey, parameterSets in
             let now = Date().timeIntervalSince1970
             if let ps = parameterSets {
                 let sets = ps.encoded()
@@ -2191,6 +2203,15 @@ package final class StreamCoordinator {
             }
             server.broadcast(StreamMessage(kind: .frame, timestamp: now, isKeyframe: isKey, payload: data), picture: picture)
         }
+        // 一帧的去处：编码后走 kind 1，原始帧模式则原样走 kind 45。
+        let deliver: (CVPixelBuffer, CMTime) -> Void
+        if let enc {
+            deliver = { pixelBuffer, pts in enc.encode(pixelBuffer, pts: pts) }
+        } else {
+            let sender = RawFrameSender(server: server, picture: picture)
+            rawSender = sender
+            deliver = { pixelBuffer, _ in sender.send(pixelBuffer) }
+        }
         if source == .desktop, picture != .placeholder, desktopStartsToFail > 0 {
             // TEST ONLY (SILL_TEST_DESKTOP_FAIL, a --synthetic host): this start fails where the capture
             // would start, after the encoder was made, as ScreenCaptureKit's did on 2026-10-28.
@@ -2200,30 +2221,39 @@ package final class StreamCoordinator {
         }
         if picture == .placeholder {
             // A locked Mac: a black still, no ScreenCaptureKit, nothing of the Mac (StillCapture).
-            stillCapture.onFrame = { pixelBuffer, pts in enc.encode(pixelBuffer, pts: pts) }
+            stillCapture.onFrame = deliver
             stillCapture.start(width: width, height: height)
         } else if let filter {
-            capture.onFrame = { pixelBuffer, pts in enc.encode(pixelBuffer, pts: pts) }
+            capture.onFrame = deliver
             try await capture.start(filter: filter, width: width, height: height, fps: fps, showsCursor: false, sourceRect: sourceRect,
-                                    scaleWords: CaptureScale.words(knob: captureScale, displayScale: displayScale))
+                                    scaleWords: CaptureScale.words(knob: captureScale, displayScale: displayScale),
+                                    bgra: raw)
         } else {
-            syntheticCapture.onFrame = { pixelBuffer, pts in enc.encode(pixelBuffer, pts: pts) }
-            syntheticCapture.start(width: width, height: height, fps: fps)
+            syntheticCapture.onFrame = deliver
+            syntheticCapture.start(width: width, height: height, fps: fps, bgra: raw)
         }
         encoder = enc
         placeholderStreams = picture == .placeholder
         active = source
         streamDisplayScale = displayScale
         injector.displayScale = displayScale
-        print("Streaming \(describe) at \(width)×\(height), \(fps) fps, \(streamBitrate / 1_000_000) Mbps")
+        if raw {
+            let mb = Double(width * height * 4) * Double(fps) * 8 / 1_000_000
+            print("Streaming \(describe) at \(width)×\(height), \(fps) fps, 未压缩原始帧 "
+                  + String(format: "%.0f Mbps", mb) + "（不经过编码器）")
+        } else {
+            print("Streaming \(describe) at \(width)×\(height), \(fps) fps, \(streamBitrate / 1_000_000) Mbps")
+        }
         status.update {
             $0.stream = HostStatusSnapshot.Stream(kind: kind, title: title, width: width, height: height, fps: fps,
-                                                  mbps: streamBitrate / 1_000_000, onVirtualDisplay: sourceRect != nil,
+                                                  mbps: raw ? Int(Double(width * height * 4) * Double(fps) * 8 / 1_000_000)
+                                                            : streamBitrate / 1_000_000,
+                                                  onVirtualDisplay: sourceRect != nil,
                                                   softwareEncoder: useSoftwareEncoder)
         }
         // Frames can reach the encoder while `capture.start` is still awaiting, so its watchdog
         // may already have fired, and that report was ignored (no current encoder yet).
-        if enc.isDead { Task { @MainActor in await self.encoderHung(enc) } }
+        if let enc, enc.isDead { Task { @MainActor in await self.encoderHung(enc) } }
     }
 
     // MARK: Bringing the target forward

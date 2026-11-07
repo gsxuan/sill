@@ -29,13 +29,17 @@ final class WindowCapture: NSObject, SCStreamOutput, SCStreamDelegate {
     /// buffer's top-left with one black column or row past it (`CaptureScale.windowPixels`).
     /// `scaleWords` end the line ("capturing at 1x, the display's own (2x asked)").
     func start(filter: SCContentFilter, width: Int, height: Int, fps: Int, showsCursor: Bool, sourceRect: CGRect? = nil,
-               scaleWords: String? = nil) async throws {
+               scaleWords: String? = nil, bgra: Bool = false) async throws {
         let config = SCStreamConfiguration()
         config.width = width
         config.height = height
-        config.pixelFormat = kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
+        // 原始帧模式要 BGRA：ScreenCaptureKit 自己转（它的转换在采集管线里，比拿 420v 出来
+        // 再用 CPU/GPU 转一遍便宜），编码模式仍旧 420v，交给 VideoToolbox 硬件编码。
+        config.pixelFormat = bgra ? kCVPixelFormatType_32BGRA : kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
         config.minimumFrameInterval = CMTime(value: 1, timescale: CMTimeScale(fps))
-        config.queueDepth = 5   // headroom: a wedged encoder may keep one buffer forever
+        // 极致模式：采集队列深度 1。每多一格就是 ~8ms（120fps）排队延迟；
+        // 低延迟链路宁可丢帧也不要积压旧画面。原始帧模式仍用 2 格防抖动。
+        config.queueDepth = bgra ? 2 : 1
         config.showsCursor = showsCursor
         config.colorSpaceName = CGColorSpace.sRGB
         if let sourceRect {
