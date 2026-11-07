@@ -1,3 +1,5 @@
+English | [简体中文](README.zh-CN.md)
+
 # Sill
 
 Any window from your Mac, on your iPhone and iPad.
