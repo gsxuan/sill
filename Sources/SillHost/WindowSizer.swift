@@ -131,6 +131,17 @@ final class WindowSizer {
         }
     }
 
+    /// 把不在屏幕上的窗口调出来（最小化 / 其他 Space / app 被隐藏）：先激活它的 app，
+    /// 再对窗口发 kAXRaiseAction，让 ScreenCaptureKit 能真的采到它，而不是只给一帧 suspended。
+    /// 返回 true 表示已发出动作（不代表窗口一定已上屏，调用方刷新目录再确认）。
+    @discardableResult
+    static func raise(pid: pid_t, frame rect: CGRect) -> Bool {
+        guard AXIsProcessTrusted(), let el = axWindow(pid: pid, frame: rect) else { return false }
+        AXUIElementSetMessagingTimeout(el, 1.0)
+        NSRunningApplication(processIdentifier: pid)?.activate(options: [.activateAllWindows])
+        return AXUIElementPerformAction(el, kAXRaiseAction as CFString) == .success
+    }
+
     /// Moves a window's top-left corner (CG global points).
     static func setPosition(_ element: AXUIElement, _ origin: CGPoint) -> AXError { set(element, position: origin) }
 

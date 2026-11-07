@@ -1888,6 +1888,20 @@ package final class StreamCoordinator {
         judgeLinks(source == .none ? nil : LinkJudge.Quality(bitrate: bitrate, fps: fps, captureScale: Double(captureScale)))
         let comeForward = bringForward || cameHome
 
+        // 窗口在别的 Space / 被最小化 / app 被隐藏：先把它调出来，否则 ScreenCaptureKit
+        // 只给一帧 suspended（客户端看到一片黑）。目录现在会列出这些窗口并标 onScreen=false，
+        // 这里就是它们的“调出来”补偿。放在虚拟显示分支之前：虚拟显示自己会搬窗口，不需要 raise。
+        if !virtualDisplay, case .window(let id) = source,
+           catalog.infos.first(where: { $0.id == id })?.onScreen == false,
+           let w = catalog.windows.first(where: { $0.windowID == id }),
+           let pid = w.owningApplication?.processID {
+            if WindowSizer.raise(pid: pid, frame: w.frame) {
+                print("Catalog: window \(id) was off-screen; raised it before capture.")
+                try? await Task.sleep(nanoseconds: 400_000_000)   // 给它上屏的时间
+                await catalog.refreshWindows()
+            }
+        }
+
         if virtualDisplay {
             // The stage follows the selection. A different window sends the staged one home first
             // and keeps the display for the newcomer; the same window keeps its place (prepare then

@@ -293,9 +293,9 @@ final class WindowCatalog {
         refreshSeq += 1
         let seq = refreshSeq
         guard !Self.screenless else { return }      // TEST ONLY: ScreenCaptureKit never asked
-        // 只列屏幕上可见的窗口（上游原样）。最小化的、在别的桌面空间的、隐藏 app 的窗口，
-        // ScreenCaptureKit 只给一帧 suspended 就再无画面：列出来只会让设备选了一片黑。
-        // 要串流这样的 app，设备从「所有应用」里启动它（kind 7，reopen 会把窗口带回屏幕）。
+        // 目录列出全部窗口（含最小化、其他 Space、隐藏 app），并标记 onScreen。
+        // 不可见窗口不能直接采：ScreenCaptureKit 只给一帧 suspended 就再无画面。
+        // 所以选中 onScreen=false 的窗口时，由 select 先把它调出来再采集（WindowSizer.raise）。
         guard let content = try? await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true) else {
             // 最常见的失败原因就是「屏幕录制」没授权：系统不再允许程序弹这个框，
             // 只能人工在设置里用「+」把 app 加进列表。这里明确说清楚，否则远端只看到
@@ -309,15 +309,9 @@ final class WindowCatalog {
             return
         }
         Self.reportedNoScreenPermission = false
-        // The staged window, if the on-screen list dropped it: one extra SCShareableContent call per
-        // poll, and only then. Fetched before the sequence check so its await cannot let an older
-        // refresh overwrite a newer one.
-        var pinned: SCWindow? = nil
-        if let id = stagedWindowID, !content.windows.contains(where: { $0.windowID == id }),
-           let all = await Self.shareableContent(excludingDesktopWindows: false, onScreenWindowsOnly: false, timeout: 3) {
-            pinned = all.windows.first { $0.windowID == id && !Self.isOwn($0) }
-            if pinned != nil { print("Catalog: the staged window \(id) is not in the on-screen list; pinned it from the full list.") }
-        }
+        let onScreenIDs = Set(content.windows.map(\.windowID))
+        // 全量窗口（含不可见）：只用来补齐目录，applications/displays 仍取 on-screen 那份。
+        let allContent = await Self.shareableContent(excludingDesktopWindows: false, onScreenWindowsOnly: false, timeout: 3)
         guard seq > appliedSeq else { return }      // a newer refresh already landed; don't go backwards
         appliedSeq = seq
         lookedAt = .now
@@ -325,7 +319,8 @@ final class WindowCatalog {
         display = preferMainDisplay
             ? (content.displays.first { $0.displayID == CGMainDisplayID() } ?? content.displays.first)
             : content.displays.first
-        var visible = content.windows.filter { w in
+        let pool = allContent?.windows ?? content.windows
+        var candidates = pool.filter { w in
             guard let app = w.owningApplication, !app.applicationName.isEmpty else { return false }
             return w.windowLayer == 0                                  // drops widgets, wallpaper, backstop
                 && w.frame.width > 100 && w.frame.height > 100
@@ -333,18 +328,22 @@ final class WindowCatalog {
                 && !Self.isSameApp(app)                                // 融合 app 自己的控制台窗口
                 && !Self.isSystemHelperWindow(w)
         }
-        if let pinned, !visible.contains(where: { $0.windowID == pinned.windowID }) { visible.append(pinned) }
+        // 在屏幕上的窗口排在前面，其余保持稳定顺序（seenOrder 在本轮内不再打乱）。
+        candidates.sort { lhs, rhs in
+            (onScreenIDs.contains(lhs.windowID) ? 0 : 1) < (onScreenIDs.contains(rhs.windowID) ? 0 : 1)
+        }
         // The system's order is not front-to-back and shuffles between polls. The brief wants a
         // fixed order in the bar, so keep first-seen order and append newcomers.
-        let byID = Dictionary(uniqueKeysWithValues: visible.map { ($0.windowID, $0) })
-        seenOrder = seenOrder.filter { byID[$0] != nil } + visible.map(\.windowID).filter { !seenOrder.contains($0) }
+        let byID = Dictionary(uniqueKeysWithValues: candidates.map { ($0.windowID, $0) })
+        seenOrder = seenOrder.filter { byID[$0] != nil } + candidates.map(\.windowID).filter { !seenOrder.contains($0) }
         let ordered = seenOrder.compactMap { byID[$0] }
         let newInfos = ordered.map { w in
             WindowInfo(id: w.windowID,
                        title: w.title ?? "",
                        appName: w.owningApplication?.applicationName ?? "",
                        bundleID: w.owningApplication?.bundleIdentifier ?? "",
-                       width: Int(w.frame.width), height: Int(w.frame.height))
+                       width: Int(w.frame.width), height: Int(w.frame.height),
+                       onScreen: onScreenIDs.contains(w.windowID))
         }
         windows = ordered
         Stats.shared.windowCount = ordered.count

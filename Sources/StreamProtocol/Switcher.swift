@@ -15,10 +15,15 @@ public struct WindowInfo: Codable, Hashable, Identifiable {
     public var bundleID: String
     public var width: Int      // points
     public var height: Int
+    /// 窗口当前是否在屏幕上（未最小化、不在其他 Space、app 未被隐藏）。
+    /// nil：旧被控端未提供；true/false：新被控端明确标记。
+    /// 客户端可对 false 的窗口显示"未显示"，选中时被控端会先把它调出来再采集。
+    public var onScreen: Bool?
 
-    public init(id: UInt32, title: String, appName: String, bundleID: String, width: Int, height: Int) {
+    public init(id: UInt32, title: String, appName: String, bundleID: String, width: Int, height: Int,
+                onScreen: Bool? = nil) {
         self.id = id; self.title = title; self.appName = appName; self.bundleID = bundleID
-        self.width = width; self.height = height
+        self.width = width; self.height = height; self.onScreen = onScreen
     }
 }
 
