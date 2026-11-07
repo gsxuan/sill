@@ -11,6 +11,8 @@ let package = Package(
         .executable(name: "SillHost", targets: ["SillHostCLI"]),
         // Sill.app's executable. Scripts/make-app.sh wraps it into the bundle and signs it.
         .executable(name: "SillMenuBar", targets: ["SillMenuBar"]),
+        // 融合 app 用：把被控端主体当库链接进自己，以 `--host-mode` 重入，TCC 身份才与 app 一致。
+        .library(name: "SillHostMain", targets: ["SillHostMain"]),
         // No product for SillHostCore: the iOS project links this package and must never see it.
     ],
     targets: [
@@ -21,7 +23,9 @@ let package = Package(
         // ../SillHost/VirtualDisplay.swift stay valid.
         .target(name: "SillHostCore", dependencies: ["StreamProtocol"], path: "Sources/SillHost"),
         // The command-line host: flags, the run loop, the Terminal permission hint.
-        .executableTarget(name: "SillHostCLI", dependencies: ["SillHostCore", "StreamProtocol"]),
+        .executableTarget(name: "SillHostCLI", dependencies: ["SillHostMain", "SillHostCore", "StreamProtocol"]),
+        // 被控端主体（runSillHostCLI）+ 中文日志层：CLI 与融合 app 共用。
+        .target(name: "SillHostMain", dependencies: ["SillHostCore", "StreamProtocol"], path: "Sources/SillHostMain"),
         // The menu bar app: status item, Settings and Log windows (AppKit lifecycle, SwiftUI panes).
         .executableTarget(name: "SillMenuBar", dependencies: ["SillHostCore", "StreamProtocol"]),
         // Milestone 3 spike: virtual display + window move + capture. Its VirtualDisplay.swift
